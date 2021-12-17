@@ -1,0 +1,144 @@
+// Script Parameters
+
+ref = file(params.reference)
+
+/*
+Create 'read_pairs' channel that emits for each read pair a
+tuple containing 3 elements: pair_id, R1, R2
+*/
+Channel
+    .fromFilePairs( params.reads )
+    .ifEmpty { error "Cannot find any reads matching: ${params.reads}" }
+    .set { read_pairs }
+
+// cutadapt based quality filtering and QC
+// Filter to only reads with primer detected and trim poly-g
+process cutadapt {
+    
+	publishDir "${params.outdir}/$pair_id",
+		saveAs: {filename ->
+			if (filename.indexOf(".fastq.gz") > 0) "filtered/$filename"
+			else if (filename.indexOf(".cutadapt.log") > 0) "logs/$filename"
+			else filename
+		}
+
+	input:
+	set pair_id, file(reads) from read_pairs
+
+	output:
+	set pair_id, file( "filtered_${pair_id}_R{1,2}.fastq.gz" ) into filtered_reads
+	file("${pair_id}.cutadapt.log")
+
+ 	conda 'bioconda::cutadapt'
+
+	script:
+	"""
+	#!/usr/bin/env bash
+
+	cutadapt \
+	    --action=trim \
+        --nextseq-trim=20 \
+        --discard-untrimmed \
+        -g ^NNNGTGGTTGGTGCTGTAGGAGCA -g ^NNGTGGTTGGTGCTGTAGGAGCA -g ^NGTGGTTGGTGCTGTAGGAGCA -g ^GTGGTTGGTGCTGTAGGAGCA \
+		-G ^NNNGAGGCCATGGCATATGCTTATCA -G ^NNGAGGCCATGGCATATGCTTATCA -G ^NGAGGCCATGGCATATGCTTATCA -G ^GAGGCCATGGCATATGCTTATCA \
+        -o filtered_${pair_id}_R1.fastq.gz \
+        -p filtered_${pair_id}_R2.fastq.gz \
+        ${reads[0]} \
+        ${reads[1]} \
+        > ${pair_id}.cutadapt.log
+	"""
+}
+
+
+// bwa based alignment
+process bwa_align {
+
+	publishDir "${params.outdir}/$pair_id"
+
+	input:
+	set pair_id, file(reads) from filtered_reads
+
+    conda 'bioconda::bwa bioconda::samtools'
+
+	output:
+	set pair_id, "${pair_id}.bam" into bam_list
+	file "${pair_id}.bam.bai"
+
+	time '2h'
+	cpus 8
+	penv 'smp' 
+	memory '16 GB'
+
+	script:
+
+	"""
+	#!/usr/bin/env bash
+
+	# alignment
+	bwa mem -t 8 $ref ${reads} | \
+		samtools view -b -o temp.bam
+
+	# sorting reads
+	samtools sort -@ 8 -o ${pair_id}.bam temp.bam
+
+	# index bam
+	samtools index ${pair_id}.bam
+
+	# remove intermediary bams
+	rm temp.bam
+
+	"""
+}
+
+
+// target mapping stats
+process mapping_statistics {
+
+	publishDir "${params.outdir}/$pair_id"
+
+	input:
+	set pair_id, file(bam) from bam_list
+
+	output:
+	file "${pair_id}_mapping.tab"
+	file "${pair_id}_mapping.summary.tab"
+	file "${pair_id}_mapping.unfiltered.tab"
+	file "${pair_id}_mapping.unfiltered.summary.tab"
+	file "${pair_id}_mapping.semifiltered.tab"
+	file "${pair_id}_mapping.semifiltered.summary.tab"
+
+ 	conda 'bioconda::samtools'
+
+	time '1h'
+	cpus '1'
+	memory '8 GB'
+
+	validExitStatus 0,1
+
+	script:
+
+	"""
+	#!/usr/bin/env bash
+	
+	( samtools view -F 2304 ${bam} | \
+		cut -f 3,6  | \
+		grep -e "[IDSH*]" -v >> ${pair_id}_mapping.tab && \
+	cut -f 1 ${pair_id}_mapping.tab | uniq -c > ${pair_id}_mapping.summary.tab ) || \
+	( echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.tab && \
+	echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.summary.tab )
+	
+	( samtools view -F 2304 ${bam} | \
+		cut -f 3,6 >> ${pair_id}_mapping.unfiltered.tab && \
+	cut -f 1 ${pair_id}_mapping.unfiltered.tab | uniq -c > ${pair_id}_mapping.unfiltered.summary.tab ) || \
+	( echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.unfiltered.tab && \
+	echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.unfiltered.summary.tab )
+	
+	( samtools view -F 2304 ${bam} | \
+		cut -f 3,6  | \
+		grep -e "[ID*]" -v >> ${pair_id}_mapping.semifiltered.tab && \
+	cut -f 1 ${pair_id}_mapping.tab | uniq -c > ${pair_id}_mapping.semifiltered.summary.tab ) || \
+	( echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.semifiltered.tab && \
+	echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.semifiltered.summary.tab )
+	"""
+
+}
